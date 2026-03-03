@@ -17,11 +17,11 @@ Kafka consumer for Solana block messages with **reorg detection and rollback**. 
 
 ## Flow: buffer → sort by slot → reorg logic
 
-1. **Buffer** (`buffer.py`): Messages are appended via `ReorgBuffer.add(block_hash, parent_hash, slot, tx_block)`. When the buffer reaches `REORG_BUFFER_SIZE` (default 10), a batch is returned **sorted by slot** and the buffer is cleared. On shutdown, `flush()` returns any remaining blocks (also sorted by slot).
+1. **Buffer** (`buffer.py`): Single purpose — hold the **resulting tree** at the head (~30 slots) so we can determine which branch is longer. Messages are appended via `ReorgBuffer.add(block_hash, parent_hash, slot, tx_block)`. When the buffer reaches `REORG_BUFFER_SIZE`, a batch is returned **sorted by slot** and the buffer is cleared. On shutdown, `flush()` returns any remaining blocks. Parent hash is always set (no special handling for missing).
 
 2. **Process batch** (`consumer.py`): For each batch (from `add()` or `flush()`), the consumer runs reorg logic in slot order via `apply_block_to_chain` from `computations.py`, then logs rollbacks and increments `processed_count`.
 
-So blocks are **reordered by slot** before chain/reorg updates, which reduces out-of-order effects. A **single consumer** (`NUM_CONSUMERS = 1`) is used so one process sees one sequence; multiple consumers would see interleaved messages and can trigger false reorgs.
+Blocks are **reordered by slot** before chain/reorg updates. A **single consumer** (`NUM_CONSUMERS = 1`) is used so one process sees one sequence; multiple consumers would see interleaved messages and can trigger false reorgs.
 
 ---
 
