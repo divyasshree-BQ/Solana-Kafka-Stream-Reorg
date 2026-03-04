@@ -1,8 +1,7 @@
 # Solana Kafka consumer (reorg-aware)
 
-Kafka consumer for Solana block messages with **reorg detection and rollback**. Uses block **hash** as identity so chain reversals are handled correctly.
+Kafka consumer for [Bitquery Solana Kafka Stream](https://docs.bitquery.io/docs/streams/protobuf/chains/Solana-protobuf/) with **reorg detection and rollback**. Uses block **hash** as identity so chain reversals are handled correctly.
 
----
 
 ## Project layout 
 
@@ -13,7 +12,6 @@ Kafka consumer for Solana block messages with **reorg detection and rollback**. 
 | **`computations.py`** | Chain/reorg logic: `hash_bytes`, `is_reorg`, `find_fork_point`, `get_chain_length`, `get_orphaned_hashes`, `apply_block_to_chain`, `rollback_orphaned`. |
 | **`config.py`** | Credentials (e.g. `solana_username`, `solana_password`).
 
----
 
 ## Flow: buffer → sort by slot → reorg logic
 
