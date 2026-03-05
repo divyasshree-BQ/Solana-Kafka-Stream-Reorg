@@ -131,8 +131,9 @@ def apply_block_to_chain(
     # Fork: compare branch lengths; only reorg when incoming branch is longer
     fork_point = find_fork_point(tip_hash, parent_hash, chain)
     if fork_point is None:
-        logger.debug(
-            "REORG: cannot find fork point (incoming parent not in chain?). Adding block anyway."
+        logger.info(
+            "REORG: cannot find fork point for block %s (incoming parent not in chain). Adding block anyway.",
+            block_hash.hex()
         )
         parent_depth = get_chain_length(parent_hash, chain)
         depth = (parent_depth + 1) if parent_depth else 0
