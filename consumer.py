@@ -10,7 +10,7 @@ from google.protobuf.message import DecodeError
 from solana import parsed_idl_block_message_pb2
 import config
 from computations import BlockInfo, hash_bytes, apply_block_to_chain, rollback_orphaned
-from buffer import ReorgBuffer, REORG_BUFFER_SIZE
+from buffer import ShredStreamBuffer
 
 # =========================================================
 # KAFKA CONFIG
@@ -40,6 +40,8 @@ NUM_CONSUMERS = 1
 shutdown_event = threading.Event()
 processed_count = 0
 processed_count_lock = threading.Lock()
+last_buffer_log_time = 0.0
+buffer_log_lock = threading.Lock()
 
 # =========================================================
 # LOGGING
@@ -58,12 +60,42 @@ _chain: dict[bytes, BlockInfo] = {}
 _tip_hash: bytes | None = None
 _chain_lock = threading.Lock()
 
-reorg_buffer = ReorgBuffer(REORG_BUFFER_SIZE)
+stream_buffer = ShredStreamBuffer()
+
+
+def log_buffer_stats():
+    """Periodically log buffer state so live runs show progress."""
+    global last_buffer_log_time
+    now = time.time()
+    with buffer_log_lock:
+        if now - last_buffer_log_time < 10:
+            return
+        last_buffer_log_time = now
+
+    stats = stream_buffer.stats()
+    logger.info(
+        "Buffers: max_slot=%d assembly_pending_slots=%d hash_blocks=%d "
+        "assembly_emitted=%d connected_pending=%d connected_released=%d "
+        "reorg_pending=%d",
+        stats["assembly_max_seen_slot"],
+        stats["assembly_pending_slots"],
+        stats["assembly_hash_bearing_blocks"],
+        stats["assembly_emitted_blocks"],
+        stats["connected_pending_blocks"],
+        stats["connected_released_blocks"],
+        stats["reorg_pending_blocks"],
+    )
 
 
 def _process_batch(batch: list):
-    """Apply reorg logic and output for a batch of blocks (sorted by slot)."""
+    """Apply reorg logic to parent-connected assembled blocks."""
     global _tip_hash, processed_count
+    logger.info(
+        "Processing reorg batch: %d connected block(s), slot span %d-%d",
+        len(batch),
+        batch[0][2],
+        batch[-1][2],
+    )
     for block_hash, parent_hash, slot, tx_block in batch:
         with _chain_lock:
             _tip_hash, orphaned = apply_block_to_chain(
@@ -77,10 +109,9 @@ def _process_batch(batch: list):
             processed_count += 1
 
 
-def flush_reorg_buffer():
-    """Drain buffer, sort by slot, then apply reorg logic and process in order."""
-    batch = reorg_buffer.flush()
-    if batch:
+def flush_buffers():
+    """Drain all stream buffers during shutdown."""
+    for batch in stream_buffer.flush():
         _process_batch(batch)
 
 
@@ -97,13 +128,20 @@ def process_message(buffer):
         block_hash = hash_bytes(header.Hash)
         parent_hash = hash_bytes(header.ParentHash)
 
-        if not block_hash or not parent_hash:
-            logger.debug("Skipping block at slot %d: empty hash or parent_hash", slot)
-            return
-
-        batch = reorg_buffer.add(block_hash, parent_hash, slot, tx_block)
-        if batch:
-            _process_batch(batch)
+        batches = stream_buffer.add(
+            block_hash, parent_hash, slot, tx_block
+        )
+        if batches:
+            for batch in batches:
+                _process_batch(batch)
+        else:
+            logger.debug(
+                "Buffered shred part for slot %d: hash=%s txs=%d",
+                slot,
+                "yes" if block_hash else "no",
+                len(tx_block.Transactions),
+            )
+        log_buffer_stats()
 
     except DecodeError as e:
         logger.error(f"Decode error: {e}")
@@ -152,7 +190,7 @@ def consumer_worker(consumer_id):
     except Exception as e:
         logger.exception(f"Consumer {consumer_id} error: {e}")
     finally:
-        flush_reorg_buffer()
+        flush_buffers()
         consumer.close()
         logger.info(f"Consumer {consumer_id} closed")
 

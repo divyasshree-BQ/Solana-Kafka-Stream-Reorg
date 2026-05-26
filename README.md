@@ -2,24 +2,59 @@
 
 Kafka consumer for [Bitquery Solana Kafka Stream](https://docs.bitquery.io/docs/streams/protobuf/chains/Solana-protobuf/) with **reorg detection and rollback**. Uses block **hash** as identity so chain reversals are handled correctly.
 
+## Project Layout
 
-## Project layout 
-
-| File | Role |
-|------|------|
-| **`consumer.py`** | Kafka consumer, message parsing, and orchestration. Owns in-memory chain state (`_chain`, `_tip_hash`) and calls buffer + computations. |
-| **`buffer.py`** | Reorg buffer: collect blocks, sort by slot, yield batches. `ReorgBuffer.add()` and `ReorgBuffer.flush()`. |
+| File                  | Role                                                                                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`consumer.py`**     | Kafka consumer, message parsing, and orchestration. Owns in-memory chain state (`_chain`, `_tip_hash`) and calls buffer + computations.                 |
+| **`buffer.py`**       | Shred/block assembly, parent-connectivity, and reorg batching behind `ShredStreamBuffer`.                                                               |
 | **`computations.py`** | Chain/reorg logic: `hash_bytes`, `is_reorg`, `find_fork_point`, `get_chain_length`, `get_orphaned_hashes`, `apply_block_to_chain`, `rollback_orphaned`. |
-| **`config.py`** | Credentials (e.g. `solana_username`, `solana_password`).
+| **`config.py`**       | Credentials (e.g. `solana_username`, `solana_password`).                                                                                                |
 
+## Flow: Shred Assembly → Parent Connectivity → Reorg Logic
 
-## Flow: buffer → sort by slot → reorg logic
+1. **Block assembly** (`buffer.py`): Stream messages are block parts, not complete blocks. `ShredStreamBuffer` first merges parts into block assemblies. Messages without `Header.Hash` or `Header.ParentHash` are staged by `Header.Slot`; hash-bearing messages are keyed by `Header.Hash`. Transactions are deduped by signature.
 
-1. **Buffer** (`buffer.py`): Single purpose — hold the **resulting tree** at the head (~30 slots) so we can determine which branch is longer. Messages are appended via `ReorgBuffer.add(block_hash, parent_hash, slot, tx_block)`. When the buffer reaches `REORG_BUFFER_SIZE`, a batch is returned **sorted by slot** and the buffer is cleared. On shutdown, `flush()` returns any remaining blocks. Parent hash is always set (no special handling for missing).
+2. **Parent connectivity** (`buffer.py`): Assembled blocks can still arrive out of slot order. `ShredStreamBuffer` releases a block only after its parent hash has already been released. At startup, where no persisted checkpoint exists, it bootstraps from the lowest slot in the first window.
 
-2. **Process batch** (`consumer.py`): For each batch (from `add()` or `flush()`), the consumer runs reorg logic in slot order via `apply_block_to_chain` from `computations.py`, then logs rollbacks and increments `processed_count`.
+3. **Reorg batching** (`buffer.py`): Parent-connected blocks are batched in release order. When the buffer reaches `REORG_BUFFER_SIZE`, the batch is returned for reorg processing. On shutdown, `flush()` returns any remaining blocks.
 
-Blocks are **reordered by slot** before chain/reorg updates. A **single consumer** (`NUM_CONSUMERS = 1`) is used so one process sees one sequence; multiple consumers would see interleaved messages and can trigger false reorgs.
+4. **Process batch** (`consumer.py`): For each batch returned by `ShredStreamBuffer.add()` or `ShredStreamBuffer.flush()`, the consumer runs reorg logic via `apply_block_to_chain` from `computations.py`, then logs rollbacks and increments `processed_count`.
+
+Shred delivery can be out of slot order, so blocks are assembled and released by parent-hash connectivity before chain/reorg updates. A **single consumer** (`NUM_CONSUMERS = 1`) is used so one process owns the in-memory buffers and chain state.
+
+### Stream Pipeline
+
+```
+Kafka message
+       |
+       v
+Parse ParsedIdlBlockMessage
+       |
+       v
+ShredStreamBuffer.add()
+       |
+       v
+Block assembly
+  - no hash: stage by slot
+  - hash-bearing: merge by block hash
+  - dedupe transactions by signature
+       |
+       v
+Parent-connectivity buffer
+  - hold assembled blocks until parent hash is released
+  - bootstrap from the first window if no checkpoint exists
+       |
+       v
+Reorg batch buffer
+  - batch parent-connected blocks in release order
+       |
+       v
+consumer.py::_process_batch()
+       |
+       v
+computations.py::apply_block_to_chain()
+```
 
 ---
 
@@ -75,8 +110,10 @@ A reorg only fires when the incoming fork branch becomes **strictly longer** tha
 
 ### `apply_block_to_chain()` — decision flow
 
+This flow starts after `ShredStreamBuffer` has emitted an assembled, hash-bearing, parent-connected block. Individual Kafka shred messages do not go directly into this function.
+
 ```
-New block arrives
+Assembled connected block arrives
        │
        ▼
   tip_hash == None?
@@ -106,13 +143,12 @@ New block arrives
         └── yes
                │
                ▼
-           🔁 REORG
+           REORG
         get_orphaned_hashes()  → walk local chain: tip → fork point
         pop orphaned blocks from chain
         add new block as tip
         return (new_tip, orphaned_list)
 ```
-
 
 ### Reorg handling (three steps)
 
@@ -128,9 +164,9 @@ New block arrives
 ### Flow in code
 
 - **`apply_block_to_chain(block_hash, parent_hash, slot, chain, tip_hash)`** (in `computations.py`)  
-  Mutates `chain` in place and returns `(new_tip_hash, orphaned_or_None)`.  
-  - If no tip yet → add block (depth=1), return new tip, no reorg.  
-  - If `parent_hash == tip` → extend chain (depth = 1 + parent depth), return new tip, no reorg.  
+  Mutates `chain` in place and returns `(new_tip_hash, orphaned_or_None)`.
+  - If no tip yet → add block (depth=1), return new tip, no reorg.
+  - If `parent_hash == tip` → extend chain (depth = 1 + parent depth), return new tip, no reorg.
   - If fork → find fork point; compare current head length and incoming branch length; only if **incoming length > current head length** → roll back orphaned blocks, add new block as tip, return new tip and orphaned list; else add block to chain but keep current tip, return that tip and `None`.
 
 - **`rollback_orphaned(orphaned_hashes)`** (in `computations.py`)  
@@ -150,7 +186,6 @@ WALK_BACK(start_hash, chain):
 ```
 
 Start from a hash (tip), follow `parent_hash` until parent is empty or missing. Uses linear walk.
-
 
 ## Running
 
